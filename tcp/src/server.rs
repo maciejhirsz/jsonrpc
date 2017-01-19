@@ -13,13 +13,14 @@
 
 use std;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio_core::reactor::Core;
 use tokio_core::net::TcpListener;
 use tokio_core::io::Io;
 use futures::{future, Future, Stream, Sink};
 use tokio_service::Service as TokioService;
+use futures::sync::mpsc;
 
 use jsonrpc::{MetaIoHandler, Metadata};
 use service::Service;
@@ -33,6 +34,22 @@ pub struct Server<M: Metadata = ()> {
     meta_extractor: Arc<MetaExtractor<M>>,
     message_queue: Arc<MessageQueue>,
     task: Arc<TaskNotificationQueue>,
+    peers: Mutex<Vec<PeerSendingQueue>>,
+}
+
+struct PeerSendingQueue {
+    addr: SocketAddr,
+    sender: mpsc::Sender<String>,
+}
+
+pub struct SinkSendError;
+
+impl From<mpsc::SendError<std::string::String>> for SinkSendError {
+    fn from(err: mpsc::SendError<std::string::String>) -> Self { SinkSendError }
+}
+
+impl From<std::io::Error> for SinkSendError {
+    fn from(err: std::io::Error) -> Self { SinkSendError }
 }
 
 impl<M: Metadata> Server<M> {
@@ -43,6 +60,7 @@ impl<M: Metadata> Server<M> {
             meta_extractor: Arc::new(NoopExtractor),
             message_queue: Default::default(),
             task: Default::default(),
+            peers: Default::default(),
         }
     }
 
@@ -85,18 +103,36 @@ impl<M: Metadata> Server<M> {
                         }
                     }));
 
-            let peer_message_queue = PeerMessageQueue::new(
-                responses,
-                self.message_queue.clone(),
-                self.task.clone(),
-                peer_addr.clone(),
-            );
+            // let peer_message_queue = PeerMessageQueue::new(
+            //     responses,
+            //     self.message_queue.clone(),
+            //     self.task.clone(),
+            //     peer_addr.clone(),
+            // );
 
-            let server = writer.send_all(peer_message_queue).then(
-                move |_| {
-                    trace!(target: "tcp", "Peer {}: service finished", peer_addr);
-                    Ok(())
-                }
+            let (sender, receiver) = mpsc::channel(65536);
+            let peer_sending_queue = PeerSendingQueue {
+                sender: sender,
+                addr: peer_addr.clone(),
+            };
+
+            let mut upstream_sender = peer_sending_queue.sender.clone();
+            //self.peers.lock().unwrap().push(peer_sending_queue);
+
+            upstream_sender
+                .with(|g| future::result::<String, SinkSendError>(Ok(g)))
+                .send_all(responses);
+
+            // responses.and_then(move |response| {
+            //     upstream_sender.start_send(response);
+            //     upstream_sender.poll_complete().map_err(|e| std::io::Error::from(std::io::ErrorKind::Other))
+            // });
+
+            let server = writer.send_all(receiver.map_err(|e| std::io::Error::from(std::io::ErrorKind::Other))).then(
+                 move |_| {
+                     trace!(target: "tcp", "Peer {}: service finished", peer_addr);
+                     Ok(())
+                 }
             );
             handle.spawn(server);
 
